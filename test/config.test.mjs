@@ -116,7 +116,14 @@ test("ports can be moved for testing without touching the site blocks", () => {
 test("writeCaddyfile forwards its options to the generator", async () => {
   // It silently dropped them once, so the port-80 workaround was computed correctly,
   // announced to the user, and then never written to the file it was meant to change.
-  const { CADDYFILE } = await import("../src/config.mjs");
-  writeCaddyfile([{ host: "a.test", port: 1 }], { disableRedirects: true });
-  assert.match(readFileSync(CADDYFILE, "utf8"), /auto_https disable_redirects/);
+  //
+  // Writes to an explicit temp path. An earlier version of this test defaulted to
+  // ~/.dropport/Caddyfile and overwrote a real machine's config with its fixture.
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const target = join(mkdtempSync(join(tmpdir(), "dropport-test-")), "Caddyfile");
+
+  writeCaddyfile([{ host: "a.test", port: 1 }], { disableRedirects: true }, target);
+  assert.match(readFileSync(target, "utf8"), /auto_https disable_redirects/);
 });

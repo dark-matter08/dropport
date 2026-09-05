@@ -10,20 +10,27 @@
 // can bind 80 and 443. Caddy issues the certificates from its own local CA, which is
 // what makes https work without a browser warning.
 import { CADDYFILE, HOME_DIR, REGISTRY, hostnameWarning, urlFor, validHostname, validPort } from "../src/config.mjs";
+import { mdnsHosts, mdnsSupported } from "../src/mdns.mjs";
 import {
   DATA_DIR,
   HOSTS_FILE,
   caddyPath,
   certTrusted,
   hostsNeedsUpdate,
+  mdnsInstalled,
+  installMdns,
   installService,
   portOptions,
   probe,
+  probeHost,
+  proxyRunning,
+  resolveMs,
   readRegistry,
   reload,
   serviceInstalled,
   syncHosts,
   trustCa,
+  uninstallMdns,
   uninstallService,
   validateConfig,
   writeCaddyfile,
@@ -104,11 +111,22 @@ async function up() {
   if (hostsNeedsUpdate(apps)) syncHosts(apps);
   installService();
   say("  proxy running.");
+
+  // A hosts entry gets a .local name to the right address, but only after the resolver
+  // waits ~5s for a multicast answer that never comes. Publishing it makes that instant.
+  const local = mdnsHosts(apps);
+  if (local.length && mdnsSupported()) {
+    const ok = installMdns();
+    say(ok
+      ? `  publishing ${local.length} .local name(s) over mDNS, so they resolve instantly`
+      : "  could not start the mDNS publisher — .local names will still work, just slowly");
+  }
   await status();
 }
 
 async function down() {
   uninstallService();
+  if (mdnsInstalled()) uninstallMdns();
   say("  proxy stopped. Hostnames stay in your hosts file; `dropport rm <host>` clears them.");
 }
 
@@ -123,15 +141,14 @@ async function status() {
   if (!apps.length) return;
 
   for (const a of apps) {
-    const url = urlFor(a);
-    const front = await probe(url);
+    const front = await probeHost(a.host, { tls: a.tls !== false });
     const back = await probe(`http://127.0.0.1:${a.port}`);
     const verdict = front.ok
       ? `${front.status}`
       : back.ok
-        ? "proxy not answering"
+        ? `proxy not answering (${front.error})`
         : "your app is not running";
-    say(`  ${url.padEnd(38)} ${verdict}`);
+    say(`  ${urlFor(a).padEnd(38)} ${verdict}`);
   }
 }
 
@@ -153,9 +170,10 @@ async function doctor() {
   v.ok ? good("Caddyfile is valid") : bad(`Caddyfile rejected:\n${v.output}`);
 
   const ports = await portOptions();
-  if (ports.https443) bad("port 443 is in use by something else — https cannot be served until that stops");
+  if (ports.ours) good("ports 80 and 443 are held by this proxy");
+  else if (ports.https443) bad("port 443 is held by something else — https cannot be served until that stops");
   else good("port 443 is free");
-  if (ports.http80) say("  · port 80 is in use, so redirects are off. https still works.");
+  if (!ports.ours && ports.http80) say("  · port 80 is in use, so redirects are off. https still works.");
 
   hostsNeedsUpdate(apps) ? bad(`${HOSTS_FILE} is out of date — dropport up`) : good(`${HOSTS_FILE} is in sync`);
   serviceInstalled() ? good("service installed") : bad("service not installed — dropport up");
@@ -163,11 +181,22 @@ async function doctor() {
   for (const a of apps) {
     const back = await probe(`http://127.0.0.1:${a.port}`);
     back.ok ? good(`${a.host}: your app is up on ${a.port}`) : bad(`${a.host}: nothing listening on ${a.port}`);
-    const front = await probe(urlFor(a));
-    if (front.ok) good(`${a.host}: reachable at ${urlFor(a)}`);
-    else if (/certificate|self.signed|unable to verify/i.test(front.error || "")) {
-      bad(`${a.host}: certificate is not trusted yet — dropport trust`);
-    } else bad(`${a.host}: ${front.error}`);
+
+    // straight to the proxy over loopback, with the hostname as SNI — a slow or
+    // failing .local lookup says nothing about whether the proxy is serving
+    const front = await probeHost(a.host, { tls: a.tls !== false });
+    if (front.ok) good(`${a.host}: the proxy serves it (HTTP ${front.status})`);
+    else bad(`${a.host}: the proxy did not answer — ${front.error}`);
+
+    const dnsr = await resolveMs(a.host);
+    if (dnsr.error) bad(`${a.host}: the name does not resolve (${dnsr.error})`);
+    else if (dnsr.ms > 1000) {
+      bad(`${a.host}: resolves to ${dnsr.address}, but takes ${(dnsr.ms / 1000).toFixed(1)}s`);
+      say(mdnsInstalled()
+        ? "    the mDNS publisher is installed but nothing is answering — check ~/.dropport/mdns.log"
+        : "    .local is answered by multicast DNS, and nothing replies, so the resolver waits out its timeout.");
+      say("    fix: dropport up (publishes it over mDNS), or use a .test name, which skips mDNS entirely.");
+    } else good(`${a.host}: resolves to ${dnsr.address} in ${dnsr.ms}ms`);
   }
   say("");
   say(problems ? `  ${problems} thing(s) to fix.` : "  all good.");
@@ -182,6 +211,7 @@ dropport — local dev servers at real hostnames, over https, with no port
   dropport up                  install and start the proxy (needs sudo)
   dropport down                stop and remove it
   dropport trust               trust the local CA, so https has no warning (needs sudo)
+  dropport mdns                publish .local names so they resolve instantly
   dropport status              is it working
   dropport doctor              why is it not working
 
@@ -208,6 +238,13 @@ try {
     case "start": await up(); break;
     case "down":
     case "stop": await down(); break;
+    case "mdns": {
+      const local = mdnsHosts(readRegistry());
+      if (!mdnsSupported()) { say("  mDNS publishing is not supported on this platform."); break; }
+      if (!local.length) { say("  no .local hostnames registered — nothing needs publishing."); break; }
+      say(installMdns() ? `  publishing: ${local.join(", ")}` : "  could not start the publisher");
+      break;
+    }
     case "trust": {
       const apps = readRegistry();
       const already = apps.length ? await certTrusted(urlFor(apps[0])) : false;

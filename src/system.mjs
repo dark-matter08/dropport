@@ -5,9 +5,9 @@
 // that escalates, and it always says what it is about to do first.
 import { execFileSync, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { platform } from "node:os";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, platform } from "node:os";
+import { dirname, resolve } from "node:path";
 import { HOME_DIR, CADDYFILE, REGISTRY, applyHostsLines, buildCaddyfile, normalise } from "./config.mjs";
 
 export const MAC = platform() === "darwin";
@@ -19,6 +19,10 @@ export const HOSTS_FILE =
 export const LABEL = "dev.dropport.proxy";
 export const PLIST = `/Library/LaunchDaemons/${LABEL}.plist`;
 export const SYSTEMD_UNIT = "/etc/systemd/system/dropport.service";
+// A user agent, not a system daemon: publishing an mDNS name needs no privilege, and
+// asking for root to do something root is not required for is how tools lose trust.
+export const MDNS_LABEL = "dev.dropport.mdns";
+export const MDNS_PLIST = resolve(homedir(), "Library", "LaunchAgents", `${MDNS_LABEL}.plist`);
 // Root-owned so the daemon can write certificates; the local CA lives here too, which
 // is why `trust` has to point at the same directory.
 export const ADMIN_ADDR = "127.0.0.1:2019";
@@ -48,10 +52,10 @@ export function writeRegistry(apps) {
   writeFileSync(REGISTRY, JSON.stringify({ apps: normalise(apps) }, null, 2) + "\n");
 }
 
-export function writeCaddyfile(apps, opts = {}) {
-  mkdirSync(HOME_DIR, { recursive: true });
-  writeFileSync(CADDYFILE, buildCaddyfile(apps, opts));
-  return CADDYFILE;
+export function writeCaddyfile(apps, opts = {}, target = CADDYFILE) {
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, buildCaddyfile(apps, opts));
+  return target;
 }
 
 /** Run something as root, announcing it first so a password prompt is never a surprise. */
@@ -176,6 +180,46 @@ export function uninstallService() {
   }
 }
 
+// --- mDNS publisher (unprivileged) -------------------------------------------
+
+const SUPERVISOR = resolve(new URL("../bin/dropport-mdns.mjs", import.meta.url).pathname);
+
+export function mdnsInstalled() {
+  return MAC ? existsSync(MDNS_PLIST) : false;
+}
+
+export function installMdns() {
+  if (!MAC) return false; // Linux users can run the supervisor from their own init
+  mkdirSync(resolve(homedir(), "Library", "LaunchAgents"), { recursive: true });
+  writeFileSync(
+    MDNS_PLIST,
+    `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${MDNS_LABEL}</string>
+  <key>ProgramArguments</key><array>
+    <string>${process.execPath}</string><string>${SUPERVISOR}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${resolve(HOME_DIR, "mdns.log")}</string>
+  <key>StandardErrorPath</key><string>${resolve(HOME_DIR, "mdns.log")}</string>
+</dict></plist>
+`
+  );
+  // no sudo: gui/<uid> is this user's own launchd domain
+  spawnSync("launchctl", ["bootout", `gui/${process.getuid?.() ?? 501}`, MDNS_PLIST], { stdio: "ignore" });
+  const r = spawnSync("launchctl", ["bootstrap", `gui/${process.getuid?.() ?? 501}`, MDNS_PLIST], { stdio: "pipe" });
+  return r.status === 0;
+}
+
+export function uninstallMdns() {
+  if (!MAC) return false;
+  spawnSync("launchctl", ["bootout", `gui/${process.getuid?.() ?? 501}`, MDNS_PLIST], { stdio: "ignore" });
+  try { rmSync(MDNS_PLIST, { force: true }); } catch {}
+  return true;
+}
+
 export function serviceInstalled() {
   return existsSync(MAC ? PLIST : SYSTEMD_UNIT);
 }
@@ -229,10 +273,84 @@ export function portInUse(port) {
   });
 }
 
-/** Global Caddyfile options that suit whatever else is already running. */
+/**
+ * Is OUR proxy the thing that is running? Its admin endpoint is the giveaway.
+ *
+ * Deliberately node:http and not fetch. Caddy's admin API refuses requests whose
+ * Origin header it does not recognise, and undici sends an empty Origin where curl
+ * and node:http send none at all — so fetch gets a 403 and the proxy looks dead
+ * while it is serving perfectly well.
+ */
+export async function proxyRunning() {
+  const [host, port] = ADMIN_ADDR.split(":");
+  const http = (await import("node:http")).default;
+  return new Promise((resolve) => {
+    const req = http.get({ host, port: Number(port), path: "/config/", timeout: 2000 }, (res) => {
+      res.resume();
+      resolve((res.statusCode || 0) < 400);
+    });
+    req.on("timeout", () => { req.destroy(); resolve(false); });
+    req.on("error", () => resolve(false));
+  });
+}
+
+/**
+ * Global Caddyfile options that suit whatever else is already running.
+ *
+ * A bound port is only a problem when someone ELSE holds it. Once our proxy is up it
+ * owns 80 and 443 by design, and reporting that as a conflict turns a healthy setup
+ * into two red crosses.
+ */
 export async function portOptions() {
+  const ours = await proxyRunning();
+  if (ours) return { disableRedirects: false, http80: false, https443: false, ours: true };
   const [http80, https443] = await Promise.all([portInUse(80), portInUse(443)]);
-  return { disableRedirects: http80, httpsBlocked: https443, http80, https443 };
+  return { disableRedirects: http80, http80, https443, ours: false };
+}
+
+/**
+ * Ask the proxy directly whether it serves a host, over the loopback address with the
+ * hostname supplied as SNI. This deliberately skips DNS: resolving a .local name takes
+ * five seconds on macOS and can fail outright from Node, which says nothing about
+ * whether the proxy is working.
+ */
+export function probeHost(host, { tls = true, ms = 6000 } = {}) {
+  return new Promise((resolve) => {
+    const mod = tls ? "node:https" : "node:http";
+    import(mod).then(({ default: lib }) => {
+      const req = lib.request(
+        {
+          host: "127.0.0.1",
+          port: tls ? 443 : 80,
+          path: "/",
+          method: "HEAD",
+          servername: tls ? host : undefined,
+          headers: { host },
+          rejectUnauthorized: false, // trust is a separate question, asked separately
+          timeout: ms,
+        },
+        (res) => {
+          res.resume();
+          resolve({ ok: true, status: res.statusCode });
+        }
+      );
+      req.on("timeout", () => { req.destroy(); resolve({ ok: false, error: "timed out" }); });
+      req.on("error", (e) => resolve({ ok: false, error: e.message }));
+      req.end();
+    });
+  });
+}
+
+/** How long the OS takes to resolve a name. .local goes via mDNS and is often slow. */
+export async function resolveMs(host) {
+  const dns = await import("node:dns/promises");
+  const t = Date.now();
+  try {
+    const a = await dns.lookup(host);
+    return { ms: Date.now() - t, address: a.address };
+  } catch (e) {
+    return { ms: Date.now() - t, error: e.code || e.message };
+  }
 }
 
 export async function probe(url, ms = 4000) {
