@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // dropport — reach your local dev servers at real hostnames over https, with no port.
 //
-//   dropport add remoteledger.local 5173
+//   dropport add remoteledger 5173
 //   dropport up
-//   -> https://remoteledger.local
+//   -> https://remoteledger.dp.local
 //
 // It is a thin, opinionated wrapper around Caddy: a registry of hostname -> port, a
 // generated Caddyfile, the matching /etc/hosts lines, and a privileged service that
@@ -256,9 +256,9 @@ dropport — local dev servers at real hostnames, over https, with no port
   dropport doctor              why is it not working
 
 Example
-  dropport add remoteledger.local 5173
+  dropport add remoteledger 5173
   dropport up
-  open https://remoteledger.local
+  open https://remoteledger.dp.local
 
 Sudo is needed for three things only: editing ${HOSTS_FILE}, installing a service
 that may bind ports 80 and 443, and adding the local CA to your trust store. Each one
