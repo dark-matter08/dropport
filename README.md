@@ -31,6 +31,15 @@ brew install caddy          # or see caddyserver.com/docs/install
 npm install -g dropport
 ```
 
+Or straight from source, no registry involved:
+
+```bash
+npm install -g github:dark-matter08/dropport
+```
+
+Caddy is a hard requirement — dropport generates its config and manages its service,
+but does the proxying and certificate work through it.
+
 ## Use
 
 ```bash
