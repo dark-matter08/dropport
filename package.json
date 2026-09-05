@@ -1,0 +1,31 @@
+{
+  "name": "dropport",
+  "version": "0.1.0",
+  "description": "Reach your local dev servers at real hostnames over https, with no port numbers. A small wrapper around Caddy.",
+  "type": "module",
+  "bin": {
+    "dropport": "bin/dropport.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "caddy",
+    "reverse-proxy",
+    "localhost",
+    "https",
+    "local-development",
+    "hosts",
+    "tls"
+  ],
+  "license": "MIT"
+}

@@ -1,0 +1,204 @@
+#!/usr/bin/env node
+// dropport — reach your local dev servers at real hostnames over https, with no port.
+//
+//   dropport add remoteledger.local 5173
+//   dropport up
+//   -> https://remoteledger.local
+//
+// It is a thin, opinionated wrapper around Caddy: a registry of hostname -> port, a
+// generated Caddyfile, the matching /etc/hosts lines, and a privileged service that
+// can bind 80 and 443. Caddy issues the certificates from its own local CA, which is
+// what makes https work without a browser warning.
+import { CADDYFILE, HOME_DIR, REGISTRY, hostnameWarning, urlFor, validHostname, validPort } from "../src/config.mjs";
+import {
+  DATA_DIR,
+  HOSTS_FILE,
+  caddyPath,
+  hostsNeedsUpdate,
+  installService,
+  probe,
+  readRegistry,
+  reload,
+  serviceInstalled,
+  syncHosts,
+  trustCa,
+  uninstallService,
+  validateConfig,
+  writeCaddyfile,
+  writeRegistry,
+} from "../src/system.mjs";
+
+const [, , cmd = "status", ...rest] = process.argv;
+const say = (m = "") => console.log(m);
+const die = (m) => {
+  console.error(`  ${m}`);
+  process.exit(1);
+};
+
+function regenerate(apps) {
+  writeRegistry(apps);
+  writeCaddyfile(apps);
+  const v = validateConfig();
+  if (!v.ok) die(`generated a config Caddy rejects:\n${v.output}`);
+  return apps;
+}
+
+async function add() {
+  const [host, port] = rest;
+  if (!validHostname(host)) die(`"${host || ""}" is not a hostname. Try: dropport add myapp.test 3000`);
+  if (!validPort(port)) die(`"${port || ""}" is not a port.`);
+
+  const warn = hostnameWarning(host);
+  if (warn) say(`  note: ${warn}`);
+
+  const apps = readRegistry().filter((a) => a.host !== host.toLowerCase());
+  apps.push({ host: host.toLowerCase(), port: Number(port) });
+  regenerate(apps);
+
+  if (hostsNeedsUpdate(apps)) syncHosts(apps);
+  if (serviceInstalled()) {
+    say(reload() ? "  proxy reloaded" : "  proxy did not reload — run: dropport up");
+  } else {
+    say("  registered. Run `dropport up` to start the proxy.");
+  }
+  say(`  ${urlFor({ host: host.toLowerCase() })}  ->  127.0.0.1:${port}`);
+}
+
+async function rm() {
+  const [host] = rest;
+  const before = readRegistry();
+  const apps = before.filter((a) => a.host !== String(host || "").toLowerCase());
+  if (apps.length === before.length) die(`${host} is not registered.`);
+  regenerate(apps);
+  if (hostsNeedsUpdate(apps)) syncHosts(apps);
+  if (serviceInstalled()) reload();
+  say(`  removed ${host}`);
+}
+
+function list() {
+  const apps = readRegistry();
+  if (!apps.length) return say("  nothing registered yet — dropport add myapp.test 3000");
+  for (const a of apps) say(`  ${urlFor(a).padEnd(38)} -> 127.0.0.1:${a.port}`);
+}
+
+async function up() {
+  if (!caddyPath()) die("caddy is not installed. brew install caddy   (or see caddyserver.com/docs/install)");
+  const apps = readRegistry();
+  if (!apps.length) die("nothing registered yet — dropport add myapp.test 3000");
+  regenerate(apps);
+  if (hostsNeedsUpdate(apps)) syncHosts(apps);
+  installService();
+  say("  proxy running.");
+  await status();
+}
+
+async function down() {
+  uninstallService();
+  say("  proxy stopped. Hostnames stay in your hosts file; `dropport rm <host>` clears them.");
+}
+
+async function status() {
+  const apps = readRegistry();
+  const caddy = caddyPath();
+  say(`  caddy   : ${caddy || "NOT INSTALLED — brew install caddy"}`);
+  say(`  service : ${serviceInstalled() ? "installed" : "not installed — run: dropport up"}`);
+  say(`  config  : ${CADDYFILE}`);
+  say(`  data    : ${DATA_DIR}`);
+  say(`  apps    : ${apps.length}`);
+  if (!apps.length) return;
+
+  for (const a of apps) {
+    const url = urlFor(a);
+    const front = await probe(url);
+    const back = await probe(`http://127.0.0.1:${a.port}`);
+    const verdict = front.ok
+      ? `${front.status}`
+      : back.ok
+        ? "proxy not answering"
+        : "your app is not running";
+    say(`  ${url.padEnd(38)} ${verdict}`);
+  }
+}
+
+/** Explain, in order, why a hostname is not working yet. */
+async function doctor() {
+  const apps = readRegistry();
+  let problems = 0;
+  const bad = (m) => {
+    problems++;
+    say(`  ✗ ${m}`);
+  };
+  const good = (m) => say(`  ✓ ${m}`);
+
+  caddyPath() ? good(`caddy at ${caddyPath()}`) : bad("caddy is not installed — brew install caddy");
+  if (apps.length) good(`${apps.length} app(s) registered`);
+  else bad("no apps registered — dropport add myapp.test 3000");
+
+  const v = apps.length ? validateConfig() : { ok: true };
+  v.ok ? good("Caddyfile is valid") : bad(`Caddyfile rejected:\n${v.output}`);
+
+  hostsNeedsUpdate(apps) ? bad(`${HOSTS_FILE} is out of date — dropport up`) : good(`${HOSTS_FILE} is in sync`);
+  serviceInstalled() ? good("service installed") : bad("service not installed — dropport up");
+
+  for (const a of apps) {
+    const back = await probe(`http://127.0.0.1:${a.port}`);
+    back.ok ? good(`${a.host}: your app is up on ${a.port}`) : bad(`${a.host}: nothing listening on ${a.port}`);
+    const front = await probe(urlFor(a));
+    if (front.ok) good(`${a.host}: reachable at ${urlFor(a)}`);
+    else if (/certificate|self.signed|unable to verify/i.test(front.error || "")) {
+      bad(`${a.host}: certificate is not trusted yet — dropport trust`);
+    } else bad(`${a.host}: ${front.error}`);
+  }
+  say("");
+  say(problems ? `  ${problems} thing(s) to fix.` : "  all good.");
+}
+
+const HELP = `
+dropport — local dev servers at real hostnames, over https, with no port
+
+  dropport add <host> <port>   register an app and wire it up
+  dropport rm <host>           unregister it
+  dropport list                what is registered
+  dropport up                  install and start the proxy (needs sudo)
+  dropport down                stop and remove it
+  dropport trust               trust the local CA, so https has no warning (needs sudo)
+  dropport status              is it working
+  dropport doctor              why is it not working
+
+Example
+  dropport add remoteledger.local 5173
+  dropport up
+  open https://remoteledger.local
+
+Sudo is needed for three things only: editing ${HOSTS_FILE}, installing a service
+that may bind ports 80 and 443, and adding the local CA to your trust store. Each one
+announces itself before it runs.
+
+Registry: ${REGISTRY}
+`;
+
+try {
+  switch (cmd) {
+    case "add": await add(); break;
+    case "rm":
+    case "remove": await rm(); break;
+    case "list":
+    case "ls": list(); break;
+    case "up":
+    case "start": await up(); break;
+    case "down":
+    case "stop": await down(); break;
+    case "trust": trustCa(); say("  local CA trusted — https should be clean now."); break;
+    case "status": await status(); break;
+    case "doctor": await doctor(); break;
+    case "help":
+    case "--help":
+    case "-h": say(HELP); break;
+    default:
+      say(`  unknown command "${cmd}"`);
+      say(HELP);
+      process.exit(1);
+  }
+} catch (e) {
+  die(String(e?.message || e));
+}
