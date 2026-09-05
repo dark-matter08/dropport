@@ -21,6 +21,7 @@ export const PLIST = `/Library/LaunchDaemons/${LABEL}.plist`;
 export const SYSTEMD_UNIT = "/etc/systemd/system/dropport.service";
 // Root-owned so the daemon can write certificates; the local CA lives here too, which
 // is why `trust` has to point at the same directory.
+export const ADMIN_ADDR = "127.0.0.1:2019";
 export const DATA_DIR = MAC ? "/Library/Application Support/dropport" : "/var/lib/dropport";
 
 export function caddyPath() {
@@ -194,9 +195,25 @@ export function reload() {
 export function trustCa() {
   const caddy = caddyPath();
   if (!caddy) throw new Error("caddy not found");
-  sudo(["env", `HOME=${DATA_DIR}`, `XDG_DATA_HOME=${DATA_DIR}`, caddy, "trust"], {
-    why: "adding the local certificate authority to your system trust store",
-  });
+  if (!serviceInstalled()) throw new Error("the proxy is not installed yet — run dropport up first");
+  // caddy trust asks the running proxy for its CA over the admin API. The default
+  // "localhost" resolves to ::1 first, while the admin endpoint binds IPv4 only, so
+  // it fails with a bare "connection refused". Naming the address avoids the whole
+  // dual-stack question.
+  sudo(
+    ["env", `HOME=${DATA_DIR}`, `XDG_DATA_HOME=${DATA_DIR}`, caddy, "trust", "--address", ADMIN_ADDR],
+    { why: "adding the local certificate authority to your system trust store" }
+  );
+}
+
+/** Is the proxy's certificate already accepted without --insecure? */
+export async function certTrusted(url) {
+  try {
+    await fetch(url, { signal: AbortSignal.timeout(5000), redirect: "manual" });
+    return true;
+  } catch (e) {
+    return !/certificate|self.signed|unable to (get|verify)|CERT_/i.test(String(e?.message || e));
+  }
 }
 
 /**

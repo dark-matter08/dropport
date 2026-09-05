@@ -14,6 +14,7 @@ import {
   DATA_DIR,
   HOSTS_FILE,
   caddyPath,
+  certTrusted,
   hostsNeedsUpdate,
   installService,
   portOptions,
@@ -207,7 +208,14 @@ try {
     case "start": await up(); break;
     case "down":
     case "stop": await down(); break;
-    case "trust": trustCa(); say("  local CA trusted — https should be clean now."); break;
+    case "trust": {
+      const apps = readRegistry();
+      const already = apps.length ? await certTrusted(urlFor(apps[0])) : false;
+      if (already) { say("  already trusted — nothing to do."); break; }
+      trustCa();
+      say("  local CA trusted — https should be clean now.");
+      break;
+    }
     case "status": await status(); break;
     case "doctor": await doctor(); break;
     case "help":
