@@ -9,7 +9,18 @@
 // generated Caddyfile, the matching /etc/hosts lines, and a privileged service that
 // can bind 80 and 443. Caddy issues the certificates from its own local CA, which is
 // what makes https work without a browser warning.
-import { CADDYFILE, HOME_DIR, REGISTRY, hostnameWarning, urlFor, validHostname, validPort } from "../src/config.mjs";
+import {
+  CADDYFILE,
+  HOME_DIR,
+  REGISTRY,
+  SUFFIX,
+  bareLocalReason,
+  expandHost,
+  hostnameWarning,
+  urlFor,
+  validHostname,
+  validPort,
+} from "../src/config.mjs";
 import { mdnsHosts, mdnsSupported } from "../src/mdns.mjs";
 import {
   DATA_DIR,
@@ -54,15 +65,35 @@ async function regenerate(apps) {
 }
 
 async function add() {
-  const [host, port] = rest;
-  if (!validHostname(host)) die(`"${host || ""}" is not a hostname. Try: dropport add myapp.test 3000`);
+  const force = rest.includes("--force");
+  const [rawHost, port] = rest.filter((a) => a !== "--force");
+  const host = expandHost(rawHost);
+
+  // A bare .local name is a shared-namespace collision waiting to happen, so it is
+  // refused by default rather than warned about and accepted anyway.
+  const bare = bareLocalReason(host);
+  if (bare && !force) {
+    say(`  ${bare.why}`);
+    say("");
+    say("  Use a namespaced name instead:");
+    say(`    dropport add ${bare.label} ${port || "<port>"}          ->  ${bare.suggestion}`);
+    say("");
+    say("  Or a .test name, reserved for local development and not multicast at all:");
+    say(`    dropport add ${bare.label}.test ${port || "<port>"}`);
+    say("");
+    say(`  If you really mean ${bare.host}, pass --force.`);
+    process.exit(1);
+  }
+
+  if (!validHostname(host)) die(`"${rawHost || ""}" is not a hostname. Try: dropport add myapp 3000`);
   if (!validPort(port)) die(`"${port || ""}" is not a port.`);
 
+  if (host !== String(rawHost || "").toLowerCase()) say(`  ${rawHost} -> ${host}`);
   const warn = hostnameWarning(host);
   if (warn) say(`  note: ${warn}`);
 
-  const apps = readRegistry().filter((a) => a.host !== host.toLowerCase());
-  apps.push({ host: host.toLowerCase(), port: Number(port) });
+  const apps = readRegistry().filter((a) => a.host !== host);
+  apps.push({ host, port: Number(port) });
   const ports = await regenerate(apps);
 
   if (hostsNeedsUpdate(apps)) syncHosts(apps);
@@ -72,13 +103,13 @@ async function add() {
   } else {
     say("  registered. Run `dropport up` to start the proxy.");
   }
-  say(`  ${urlFor({ host: host.toLowerCase() })}  ->  127.0.0.1:${port}`);
+  say(`  ${urlFor({ host })}  ->  127.0.0.1:${port}`);
 }
 
 async function rm() {
   const [host] = rest;
   const before = readRegistry();
-  const apps = before.filter((a) => a.host !== String(host || "").toLowerCase());
+  const apps = before.filter((a) => a.host !== expandHost(host));
   if (apps.length === before.length) die(`${host} is not registered.`);
   await regenerate(apps);
   if (hostsNeedsUpdate(apps)) syncHosts(apps);
@@ -205,7 +236,7 @@ async function doctor() {
 const HELP = `
 dropport — local dev servers at real hostnames, over https, with no port
 
-  dropport add <host> <port>   register an app and wire it up
+  dropport add <name> <port>   register an app (a bare name becomes <name>.${SUFFIX})
   dropport rm <host>           unregister it
   dropport list                what is registered
   dropport up                  install and start the proxy (needs sudo)

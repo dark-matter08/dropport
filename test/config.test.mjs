@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import { writeCaddyfile } from "../src/system.mjs";
 import { readFileSync } from "node:fs";
 import {
+  SUFFIX,
+  bareLocalReason,
+  expandHost,
   applyHostsLines,
   buildCaddyfile,
   buildHostsLines,
@@ -126,4 +129,38 @@ test("writeCaddyfile forwards its options to the generator", async () => {
 
   writeCaddyfile([{ host: "a.test", port: 1 }], { disableRedirects: true }, target);
   assert.match(readFileSync(target, "utf8"), /auto_https disable_redirects/);
+});
+
+test("a bare name expands under the dropport suffix", () => {
+  assert.equal(expandHost("shop"), `shop.${SUFFIX}`);
+  assert.equal(expandHost("SHOP"), `shop.${SUFFIX}`, "lowercased");
+  assert.equal(expandHost("shop."), `shop.${SUFFIX}`, "a stray trailing dot is not a second label");
+
+  // anything already dotted is taken as given
+  assert.equal(expandHost("api.test"), "api.test");
+  assert.equal(expandHost("web.dp.local"), "web.dp.local");
+  assert.equal(expandHost(""), "");
+});
+
+test("bare .local names are refused, deeper ones are not", () => {
+  // printer.local is the shape real hardware uses; claiming it starts a fight
+  const bare = bareLocalReason("something.local");
+  assert.ok(bare, "a single-label .local must be refused");
+  assert.equal(bare.label, "something");
+  assert.equal(bare.suggestion, `something.${SUFFIX}`);
+  assert.match(bare.why, /shared namespace/);
+
+  // already namespaced: nothing else is publishing there
+  assert.equal(bareLocalReason(`web.${SUFFIX}`), null, "our own suffix is the recommended form");
+  assert.equal(bareLocalReason("a.b.local"), null, "someone else's namespace, but still namespaced");
+
+  // not multicast territory at all
+  assert.equal(bareLocalReason("api.test"), null);
+  assert.equal(bareLocalReason("shop.localhost"), null);
+});
+
+test("the recommended form is not warned about", () => {
+  // it suggested x.dp.local, so warning that .local is a bad idea would contradict itself
+  assert.equal(hostnameWarning(`shop.${SUFFIX}`), null);
+  assert.match(hostnameWarning("shop.local") || "", /mDNS|Bonjour/);
 });

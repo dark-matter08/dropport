@@ -43,8 +43,8 @@ but does the proxying and certificate work through it.
 ## Use
 
 ```bash
-dropport add myapp.test 5173     # register an app
-dropport add api.test 8000       # as many as you like
+dropport add myapp 5173          # -> https://myapp.dp.local
+dropport add api.test 8000       # a name with a dot is taken as given
 dropport up                      # install and start the proxy
 dropport trust                   # trust the local CA, so https is clean
 
@@ -71,16 +71,40 @@ Nothing else escalates. Hosts edits are staged to a temp file and copied in, so 
 failure can't leave you with a half-written `/etc/hosts`, and lines dropport didn't
 write are never touched.
 
-## Pick a good hostname
+## Hostnames
 
-Use **`.test`**. It is reserved for exactly this by [RFC 6761](https://www.rfc-editor.org/rfc/rfc6761)
-and nothing else competes for it.
+**Bare names are expanded**: `dropport add shop` registers `shop.dp.local`. That is the
+recommended form, and dropport publishes it over mDNS so it resolves instantly.
 
-- **`.local`** belongs to mDNS/Bonjour ([RFC 6762](https://www.rfc-editor.org/rfc/rfc6762)).
-  A hosts entry usually works, but the resolver also consults multicast DNS, which can be
-  slow or odd on some networks. dropport warns and continues.
-- **`.dev`, `.app`** are real public TLDs with HSTS preloaded. They work locally, but
-  you are shadowing a name someone else owns.
+**Bare `.local` names are refused.** `.local` is multicast DNS
+([RFC 6762](https://www.rfc-editor.org/rfc/rfc6762)) — a namespace every device on your
+network answers into, and single-label names there are exactly what printers, phones and
+other Macs use. Claiming `printer.local` means competing with a real printer, on some
+networks and not others, which is a miserable bug to chase. dropport suggests
+`printer.dp.local` instead, and `--force` is there if you truly mean it.
+
+**`.test` also works well** and skips multicast entirely. It is reserved for local
+development by [RFC 6761](https://www.rfc-editor.org/rfc/rfc6761), so nothing competes
+for it and no publisher is needed.
+
+Avoid **`.dev`** and **`.app`** — real public TLDs with HSTS preloaded. They work
+locally, but you are shadowing a name someone else owns.
+
+## Why .local is normally slow, and why it is not here
+
+A `.local` lookup is answered by multicast DNS, never by the hosts file first. When
+nothing answers, the resolver waits out its full timeout before falling back. The tell
+is that a name which does not exist at all takes just as long as one that does:
+
+```
+name nothing answers for     5009ms
+same name, published          3-9ms
+```
+
+That is how OrbStack's `*.orb.local` feels instant — not a faster lookup, but a
+responder that replies. dropport publishes its own `.local` names the same way, through
+Bonjour on macOS and Avahi on Linux, supervised so a registration outlives the command
+that created it.
 
 ## How it works
 

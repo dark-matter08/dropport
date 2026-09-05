@@ -8,6 +8,46 @@ export const REGISTRY = resolve(HOME_DIR, "apps.json");
 export const CADDYFILE = resolve(HOME_DIR, "Caddyfile");
 export const HOSTS_MARKER = "# dropport";
 
+// Bare names get expanded under here, the way OrbStack uses *.orb.local. Short on
+// purpose: you type it constantly.
+export const SUFFIX = (process.env.DROPPORT_SUFFIX || "dp.local").replace(/^\.+|\.+$/g, "");
+
+/** `dropport add shop` means shop.dp.local. Anything already dotted is taken as given. */
+export function expandHost(input) {
+  const h = String(input || "").trim().toLowerCase().replace(/\.+$/, "");
+  if (!h) return h;
+  return h.includes(".") ? h : `${h}.${SUFFIX}`;
+}
+
+/**
+ * A name like `printer.local` is not ours to claim.
+ *
+ * .local is multicast DNS: it is a shared namespace that every device on the network
+ * answers into, and single-label names there are exactly what real hardware uses. Take
+ * `printer.local` and you are competing with an actual printer — intermittently, and
+ * only on networks where it is present, which is the worst kind of bug to chase.
+ *
+ * Deeper names are fine: nothing else is publishing under *.dp.local.
+ */
+export function bareLocalReason(host) {
+  const h = String(host || "").toLowerCase();
+  if (!/\.local$/.test(h)) return null;
+  if (h.endsWith(`.${SUFFIX}`)) return null;
+  if (h.split(".").length !== 2) return null; // already namespaced, e.g. a.b.local
+  const label = h.slice(0, -".local".length);
+  return {
+    host: h,
+    label,
+    suggestion: `${label}.${SUFFIX}`,
+    why: [
+      `${h} is a bare .local name, and .local is a shared namespace.`,
+      "Every device on your network answers there — printers, phones, other Macs — and",
+      `single-label names are exactly what they use. Claiming ${h} means competing with`,
+      "whatever else already answers to it, on some networks and not others.",
+    ].join("\n  "),
+  };
+}
+
 /** Hostnames must be safe to put in a Caddyfile and a hosts file without quoting. */
 export function validHostname(host) {
   return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(host || "");
@@ -25,6 +65,10 @@ export function validPort(port) {
  * ambiguity, so we say so once rather than letting someone debug it later.
  */
 export function hostnameWarning(host) {
+  // Names under our own suffix are the recommended form and dropport publishes them
+  // over mDNS itself, so they resolve instantly. Warning about the very thing we just
+  // told the user to use would be nonsense.
+  if (String(host || "").toLowerCase().endsWith(`.${SUFFIX}`)) return null;
   if (/\.local$/i.test(host)) {
     return `${host} uses .local, which is reserved for mDNS/Bonjour. It normally works via the hosts file, but .test is the TLD reserved for local development and avoids the ambiguity entirely.`;
   }
