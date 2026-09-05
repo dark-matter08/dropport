@@ -16,6 +16,7 @@ import {
   caddyPath,
   hostsNeedsUpdate,
   installService,
+  portOptions,
   probe,
   readRegistry,
   reload,
@@ -35,12 +36,13 @@ const die = (m) => {
   process.exit(1);
 };
 
-function regenerate(apps) {
+async function regenerate(apps) {
+  const ports = await portOptions();
   writeRegistry(apps);
-  writeCaddyfile(apps);
+  writeCaddyfile(apps, { disableRedirects: ports.disableRedirects });
   const v = validateConfig();
   if (!v.ok) die(`generated a config Caddy rejects:\n${v.output}`);
-  return apps;
+  return ports;
 }
 
 async function add() {
@@ -53,9 +55,10 @@ async function add() {
 
   const apps = readRegistry().filter((a) => a.host !== host.toLowerCase());
   apps.push({ host: host.toLowerCase(), port: Number(port) });
-  regenerate(apps);
+  const ports = await regenerate(apps);
 
   if (hostsNeedsUpdate(apps)) syncHosts(apps);
+  if (ports.disableRedirects) say("  note: port 80 is taken by something else, so plain http:// will not reach this app. https does.");
   if (serviceInstalled()) {
     say(reload() ? "  proxy reloaded" : "  proxy did not reload — run: dropport up");
   } else {
@@ -69,7 +72,7 @@ async function rm() {
   const before = readRegistry();
   const apps = before.filter((a) => a.host !== String(host || "").toLowerCase());
   if (apps.length === before.length) die(`${host} is not registered.`);
-  regenerate(apps);
+  await regenerate(apps);
   if (hostsNeedsUpdate(apps)) syncHosts(apps);
   if (serviceInstalled()) reload();
   say(`  removed ${host}`);
@@ -85,7 +88,18 @@ async function up() {
   if (!caddyPath()) die("caddy is not installed. brew install caddy   (or see caddyserver.com/docs/install)");
   const apps = readRegistry();
   if (!apps.length) die("nothing registered yet — dropport add myapp.test 3000");
-  regenerate(apps);
+  const ports = await regenerate(apps);
+  if (ports.https443) {
+    die(
+      "port 443 is already in use, so the proxy cannot serve https.\n" +
+        "  Something else owns it — OrbStack, Docker Desktop or a local web server are the usual suspects.\n" +
+        "  Stop it, or point that tool elsewhere, then run dropport up again."
+    );
+  }
+  if (ports.disableRedirects) {
+    say("  port 80 is taken, so redirects are off and Caddy binds 443 only.");
+    say("  https://... works; plain http://... reaches whatever owns port 80.");
+  }
   if (hostsNeedsUpdate(apps)) syncHosts(apps);
   installService();
   say("  proxy running.");
@@ -136,6 +150,11 @@ async function doctor() {
 
   const v = apps.length ? validateConfig() : { ok: true };
   v.ok ? good("Caddyfile is valid") : bad(`Caddyfile rejected:\n${v.output}`);
+
+  const ports = await portOptions();
+  if (ports.https443) bad("port 443 is in use by something else — https cannot be served until that stops");
+  else good("port 443 is free");
+  if (ports.http80) say("  · port 80 is in use, so redirects are off. https still works.");
 
   hostsNeedsUpdate(apps) ? bad(`${HOSTS_FILE} is out of date — dropport up`) : good(`${HOSTS_FILE} is in sync`);
   serviceInstalled() ? good("service installed") : bad("service not installed — dropport up");

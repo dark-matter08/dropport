@@ -4,6 +4,7 @@
 // Everything that needs root is funnelled through sudo() so there is exactly one place
 // that escalates, and it always says what it is about to do first.
 import { execFileSync, spawnSync } from "node:child_process";
+import { createServer } from "node:net";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { platform } from "node:os";
 import { resolve } from "node:path";
@@ -46,9 +47,9 @@ export function writeRegistry(apps) {
   writeFileSync(REGISTRY, JSON.stringify({ apps: normalise(apps) }, null, 2) + "\n");
 }
 
-export function writeCaddyfile(apps) {
+export function writeCaddyfile(apps, opts = {}) {
   mkdirSync(HOME_DIR, { recursive: true });
-  writeFileSync(CADDYFILE, buildCaddyfile(apps));
+  writeFileSync(CADDYFILE, buildCaddyfile(apps, opts));
   return CADDYFILE;
 }
 
@@ -196,6 +197,25 @@ export function trustCa() {
   sudo(["env", `HOME=${DATA_DIR}`, `XDG_DATA_HOME=${DATA_DIR}`, caddy, "trust"], {
     why: "adding the local certificate authority to your system trust store",
   });
+}
+
+/**
+ * Can we bind this port? lsof lies to a non-root user about other users' sockets, so
+ * asking the kernel directly is the only answer you can trust.
+ */
+export function portInUse(port) {
+  return new Promise((resolve) => {
+    const srv = createServer();
+    srv.once("error", () => resolve(true));
+    srv.once("listening", () => srv.close(() => resolve(false)));
+    srv.listen(port, "0.0.0.0");
+  });
+}
+
+/** Global Caddyfile options that suit whatever else is already running. */
+export async function portOptions() {
+  const [http80, https443] = await Promise.all([portInUse(80), portInUse(443)]);
+  return { disableRedirects: http80, httpsBlocked: https443, http80, https443 };
 }
 
 export async function probe(url, ms = 4000) {

@@ -1,5 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { writeCaddyfile } from "../src/system.mjs";
+import { readFileSync } from "node:fs";
 import {
   applyHostsLines,
   buildCaddyfile,
@@ -89,4 +91,32 @@ test("risky TLDs are called out rather than silently accepted", () => {
 test("urls default to https", () => {
   assert.equal(urlFor({ host: "a.test" }), "https://a.test");
   assert.equal(urlFor({ host: "a.test", tls: false }), "http://a.test");
+});
+
+test("a busy port 80 turns off redirects instead of crashing the proxy", () => {
+  // Caddy grabs :80 for HTTP->HTTPS redirects even if you never asked for them, and
+  // fails to start at all if it cannot. Under launchd KeepAlive that is a silent
+  // restart loop, so this must be expressible in the config.
+  const normal = buildCaddyfile([{ host: "a.test", port: 1 }]);
+  assert.ok(!normal.includes("auto_https"), "no reason to mention it when 80 is free");
+
+  const shared = buildCaddyfile([{ host: "a.test", port: 1 }], { disableRedirects: true });
+  assert.match(shared, /auto_https disable_redirects/);
+  assert.match(shared, /local_certs/, "still uses the local CA");
+  assert.match(shared, /reverse_proxy 127\.0\.0\.1:1/, "still proxies");
+});
+
+test("ports can be moved for testing without touching the site blocks", () => {
+  const cf = buildCaddyfile([{ host: "a.test", port: 1 }], { httpPort: 8080, httpsPort: 8443 });
+  assert.match(cf, /http_port 8080/);
+  assert.match(cf, /https_port 8443/);
+  assert.match(cf, /^a\.test \{$/m);
+});
+
+test("writeCaddyfile forwards its options to the generator", async () => {
+  // It silently dropped them once, so the port-80 workaround was computed correctly,
+  // announced to the user, and then never written to the file it was meant to change.
+  const { CADDYFILE } = await import("../src/config.mjs");
+  writeCaddyfile([{ host: "a.test", port: 1 }], { disableRedirects: true });
+  assert.match(readFileSync(CADDYFILE, "utf8"), /auto_https disable_redirects/);
 });
