@@ -1,0 +1,43 @@
+name: publish
+
+# Tag a release to publish. Two registries, because they serve different needs:
+#   npmjs.com      -> `npm i -g dropport` with no auth. This is what users want.
+#   GitHub Packages -> scoped to the repo owner, but consumers need a token to install,
+#                      even when the package is public. Kept for completeness.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - run: npm test
+
+  npmjs:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", registry-url: "https://registry.npmjs.org" }
+      - run: npm publish --provenance --access public
+        env: { NODE_AUTH_TOKEN: "${{ secrets.NPM_TOKEN }}" }
+
+  github-packages:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", registry-url: "https://npm.pkg.github.com" }
+      # GitHub Packages only accepts names scoped to the owner
+      - run: npm pkg set name="@dark-matter08/dropport"
+      - run: npm publish
+        env: { NODE_AUTH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }

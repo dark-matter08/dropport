@@ -27,5 +27,14 @@
     "hosts",
     "tls"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dark-matter08/dropport.git"
+  },
+  "homepage": "https://github.com/dark-matter08/dropport#readme",
+  "bugs": {
+    "url": "https://github.com/dark-matter08/dropport/issues"
+  },
+  "author": "dark-matter08"
 }
