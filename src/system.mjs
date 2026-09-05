@@ -294,18 +294,48 @@ export async function proxyRunning() {
   });
 }
 
+/** Ask the running proxy which ports it is actually bound to. */
+export async function loadedPorts() {
+  const [host, port] = ADMIN_ADDR.split(":");
+  const http = (await import("node:http")).default;
+  const body = await new Promise((resolve) => {
+    const req = http.get({ host, port: Number(port), path: "/config/", timeout: 2000 }, (res) => {
+      let d = "";
+      res.on("data", (c) => (d += c));
+      res.on("end", () => resolve(res.statusCode === 200 ? d : ""));
+    });
+    req.on("timeout", () => { req.destroy(); resolve(""); });
+    req.on("error", () => resolve(""));
+  });
+  const out = new Set();
+  try {
+    const servers = JSON.parse(body)?.apps?.http?.servers || {};
+    for (const srv of Object.values(servers)) {
+      for (const addr of srv.listen || []) {
+        const m = /:(\d+)$/.exec(String(addr));
+        if (m) out.add(Number(m[1]));
+      }
+    }
+  } catch {}
+  return out;
+}
+
 /**
  * Global Caddyfile options that suit whatever else is already running.
  *
- * A bound port is only a problem when someone ELSE holds it. Once our proxy is up it
- * owns 80 and 443 by design, and reporting that as a conflict turns a healthy setup
- * into two red crosses.
+ * Ownership is per PORT, not per proxy. An earlier version treated "our proxy is
+ * running" as "both ports are ours", which is false whenever we hold 443 while
+ * something else holds 80 — and that is the normal case alongside OrbStack or Docker
+ * Desktop. It made the generated config drop the port-80 workaround, and the daemon
+ * then crash-looped on a port it could never have.
  */
 export async function portOptions() {
   const ours = await proxyRunning();
-  if (ours) return { disableRedirects: false, http80: false, https443: false, ours: true };
-  const [http80, https443] = await Promise.all([portInUse(80), portInUse(443)]);
-  return { disableRedirects: http80, http80, https443, ours: false };
+  const mine = ours ? await loadedPorts() : new Set();
+  const [bound80, bound443] = await Promise.all([portInUse(80), portInUse(443)]);
+  const http80 = bound80 && !mine.has(80);
+  const https443 = bound443 && !mine.has(443);
+  return { disableRedirects: http80, http80, https443, ours, mine: [...mine] };
 }
 
 /**

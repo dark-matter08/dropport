@@ -164,3 +164,19 @@ test("the recommended form is not warned about", () => {
   assert.equal(hostnameWarning(`shop.${SUFFIX}`), null);
   assert.match(hostnameWarning("shop.local") || "", /mDNS|Bonjour/);
 });
+
+test("port ownership is per port, not per proxy", async () => {
+  // The regression: treating "our proxy is running" as "we own 80 AND 443". Alongside
+  // OrbStack or Docker Desktop we typically hold 443 while something else holds 80, so
+  // that assumption dropped the port-80 workaround from the config and the daemon then
+  // crash-looped on a port it could never have. 16 restarts, nothing on screen.
+  const { buildCaddyfile } = await import("../src/config.mjs");
+
+  // whatever the reason, if 80 is not ours the config must give it up
+  const shared = buildCaddyfile([{ host: "a.test", port: 1 }], { disableRedirects: true });
+  assert.match(shared, /auto_https disable_redirects/);
+
+  // and when we do hold it, no workaround is emitted
+  const solo = buildCaddyfile([{ host: "a.test", port: 1 }], { disableRedirects: false });
+  assert.ok(!solo.includes("auto_https"));
+});

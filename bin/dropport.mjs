@@ -201,13 +201,22 @@ async function doctor() {
   v.ok ? good("Caddyfile is valid") : bad(`Caddyfile rejected:\n${v.output}`);
 
   const ports = await portOptions();
-  if (ports.ours) good("ports 80 and 443 are held by this proxy");
-  else if (ports.https443) bad("port 443 is held by something else — https cannot be served until that stops");
-  else good("port 443 is free");
-  if (!ports.ours && ports.http80) say("  · port 80 is in use, so redirects are off. https still works.");
+  if (ports.mine?.length) good(`this proxy holds port ${ports.mine.join(" and ")}`);
+  if (ports.https443) bad("port 443 is held by something else — https cannot be served until that stops");
+  else if (!ports.mine?.includes(443)) good("port 443 is free");
+  if (ports.http80) say("  · port 80 is held by something else, so redirects are off. https still works.");
 
   hostsNeedsUpdate(apps) ? bad(`${HOSTS_FILE} is out of date — dropport up`) : good(`${HOSTS_FILE} is in sync`);
-  serviceInstalled() ? good("service installed") : bad("service not installed — dropport up");
+
+  // "installed" is not "running": a daemon that cannot bind is restarted forever by
+  // launchd, and every attempt fails the same way with nothing on screen to say so.
+  if (!serviceInstalled()) bad("service not installed — dropport up");
+  else if (await proxyRunning()) good("service installed and running");
+  else {
+    bad("service is installed but the proxy is NOT running");
+    say(`    it is most likely failing to bind a port and being restarted in a loop.`);
+    say(`    check: tail "${DATA_DIR}/dropport.log"   then: dropport up`);
+  }
 
   for (const a of apps) {
     const back = await probe(`http://127.0.0.1:${a.port}`);
