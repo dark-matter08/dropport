@@ -250,13 +250,31 @@ export function trustCa() {
   );
 }
 
-/** Is the proxy's certificate already accepted without --insecure? */
+/**
+ * Is the proxy's certificate already accepted without --insecure?
+ *
+ * Asked of the SYSTEM, not of Node. Node ships its own CA bundle and does not read
+ * the macOS keychain — the store `caddy trust` writes to — so its answer is about
+ * Node's opinion rather than the browser's, and the browser's is the only one that
+ * matters here. curl validates against the same store on macOS and Linux.
+ *
+ * The previous implementation asked Node AND misread the failure: node's fetch
+ * reports every transport error as "fetch failed" and puts the real reason on
+ * `.cause`, so matching on `.message` alone read a rejected certificate as a trusted
+ * one. `trust` then said "already trusted — nothing to do" and skipped the work, on
+ * exactly the machines that needed it.
+ */
 export async function certTrusted(url) {
+  const r = spawnSync("curl", ["-sS", "-o", "/dev/null", "--max-time", "8", url], { encoding: "utf8" });
+  if (!r.error) return r.status === 0;
+
+  // no curl on this box: fall back to Node, reading the cause this time
   try {
     await fetch(url, { signal: AbortSignal.timeout(5000), redirect: "manual" });
     return true;
   } catch (e) {
-    return !/certificate|self.signed|unable to (get|verify)|CERT_/i.test(String(e?.message || e));
+    const why = [e?.message, e?.code, e?.cause?.message, e?.cause?.code].filter(Boolean).join(" ");
+    return !/certificate|self.signed|self-signed|unable to (get|verify)|CERT_|DEPTH_ZERO/i.test(why);
   }
 }
 
