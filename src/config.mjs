@@ -157,3 +157,25 @@ export function applyHostsLines(existing, apps) {
 export function urlFor(app) {
   return `${app.tls === false ? "http" : "https"}://${app.host}`;
 }
+
+/**
+ * Who owns 80 and 443, given what is bound and what our proxy says it is doing.
+ *
+ * Pure, because getting this wrong is expensive in a way that is invisible: Caddy
+ * refuses to start at all if it cannot bind a port it was told to bind, and under
+ * KeepAlive that is an endless restart rather than an error anyone sees.
+ *
+ * The subtle case is `adminUp && !bound443`. A crash-looping Caddy still answers the
+ * admin API — it starts that endpoint before binding the listeners — and reports the
+ * ports its config *wants*, including the :80 it cannot have. Believing it is how the
+ * loop sustains itself: we conclude we already hold :80, write a config that binds
+ * :80, and fail again. Serving 443 is this proxy's whole job, so one that is not
+ * holding it does not get to claim anything.
+ */
+export function portDecision({ bound80 = false, bound443 = false, adminUp = false, loaded = [] } = {}) {
+  const serving = adminUp && bound443;
+  const mine = new Set(serving ? loaded : []);
+  const http80 = bound80 && !mine.has(80);
+  const https443 = bound443 && !mine.has(443);
+  return { disableRedirects: http80, http80, https443, ours: adminUp, serving, mine: [...mine] };
+}

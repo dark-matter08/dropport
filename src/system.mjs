@@ -8,7 +8,7 @@ import { createServer } from "node:net";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { dirname, resolve } from "node:path";
-import { HOME_DIR, CADDYFILE, REGISTRY, applyHostsLines, buildCaddyfile, normalise } from "./config.mjs";
+import { HOME_DIR, CADDYFILE, REGISTRY, applyHostsLines, buildCaddyfile, normalise, portDecision } from "./config.mjs";
 
 export const MAC = platform() === "darwin";
 // Overridable so the whole flow can be exercised against a scratch file in tests
@@ -330,12 +330,39 @@ export async function loadedPorts() {
  * then crash-looped on a port it could never have.
  */
 export async function portOptions() {
-  const ours = await proxyRunning();
-  const mine = ours ? await loadedPorts() : new Set();
   const [bound80, bound443] = await Promise.all([portInUse(80), portInUse(443)]);
-  const http80 = bound80 && !mine.has(80);
-  const https443 = bound443 && !mine.has(443);
-  return { disableRedirects: http80, http80, https443, ours, mine: [...mine] };
+  const ours = await proxyRunning();
+  // A crash-looping Caddy still answers the admin API: it starts that endpoint before
+  // it binds the listeners, so there is a window every restart where it is reachable
+  // and reports the ports its config *wants* — including the :80 it cannot have. Take
+  // that as ownership and the loop feeds itself: we decide we already hold :80, write
+  // a config that binds :80, and fail again, forever, while `up` keeps saying "proxy
+  // running". Serving 443 is this proxy's whole job, so one that is not holding it is
+  // not serving, and gets no say in who owns what.
+  const loaded = ours && bound443 ? [...(await loadedPorts())] : [];
+  return portDecision({ bound80, bound443, adminUp: ours, loaded });
+}
+
+/** Wait for the proxy to actually answer after a start, rather than assuming it did. */
+export async function waitForProxy(ms = 5000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    if (await proxyRunning()) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+/** The last line Caddy wrote that looks like the reason it gave up. */
+export function lastServiceError() {
+  try {
+    const log = readFileSync(resolve(DATA_DIR, "dropport.log"), "utf8").split(/\r?\n/);
+    for (let i = log.length - 1; i >= 0 && i > log.length - 400; i--) {
+      const line = log[i].trim();
+      if (line.startsWith("Error:") || /"level":"error"/.test(line)) return line.slice(0, 300);
+    }
+  } catch {}
+  return "";
 }
 
 /**

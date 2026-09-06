@@ -33,8 +33,10 @@ import {
   installService,
   portOptions,
   probe,
+  lastServiceError,
   probeHost,
   proxyRunning,
+  waitForProxy,
   resolveMs,
   readRegistry,
   reload,
@@ -141,7 +143,17 @@ async function up() {
   }
   if (hostsNeedsUpdate(apps)) syncHosts(apps);
   installService();
-  say("  proxy running.");
+
+  // "started the service" is not "the proxy is up". launchd restarts a daemon that
+  // cannot bind, so a failure here looks like success and then loops out of sight.
+  if (await waitForProxy()) {
+    say("  proxy running.");
+  } else {
+    const err = lastServiceError();
+    say("  the proxy was installed but is NOT answering.");
+    if (err) say(`    last error: ${err}`);
+    say(`    it is being restarted in a loop — check "${DATA_DIR}/dropport.log"`);
+  }
 
   // A hosts entry gets a .local name to the right address, but only after the resolver
   // waits ~5s for a multicast answer that never comes. Publishing it makes that instant.

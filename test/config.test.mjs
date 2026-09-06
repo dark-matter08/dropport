@@ -4,6 +4,7 @@ import { writeCaddyfile } from "../src/system.mjs";
 import { readFileSync } from "node:fs";
 import {
   SUFFIX,
+  portDecision,
   bareLocalReason,
   expandHost,
   applyHostsLines,
@@ -179,4 +180,28 @@ test("port ownership is per port, not per proxy", async () => {
   // and when we do hold it, no workaround is emitted
   const solo = buildCaddyfile([{ host: "a.test", port: 1 }], { disableRedirects: false });
   assert.ok(!solo.includes("auto_https"));
+});
+
+test("port ownership: a proxy that is not serving cannot claim a port", () => {
+  // healthy: we hold both, so nothing looks like a competitor
+  const healthy = portDecision({ bound80: true, bound443: true, adminUp: true, loaded: [80, 443] });
+  assert.equal(healthy.disableRedirects, false, "we own :80, so keep the redirects");
+  assert.equal(healthy.https443, false, "443 is ours, not someone else's");
+
+  // the trap: Caddy is crash-looping. Its admin endpoint answers during the window
+  // between loading the config and failing to bind, and reports the :80 it wants.
+  // Nothing is on 443 because it never got that far.
+  const looping = portDecision({ bound80: true, bound443: false, adminUp: true, loaded: [80, 443] });
+  assert.equal(looping.serving, false, "not holding 443 means not serving");
+  assert.deepEqual(looping.mine, [], "a corpse mid-restart claims nothing");
+  assert.equal(looping.disableRedirects, true, "so we give up :80 and actually start");
+
+  // somebody else genuinely holds 443
+  const taken = portDecision({ bound80: false, bound443: true, adminUp: false, loaded: [] });
+  assert.equal(taken.https443, true, "443 is taken by something that is not us");
+
+  // clean machine
+  const fresh = portDecision({});
+  assert.equal(fresh.disableRedirects, false);
+  assert.equal(fresh.https443, false);
 });
