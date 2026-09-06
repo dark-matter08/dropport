@@ -1,6 +1,6 @@
 {
   "name": "dropport",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Reach your local dev servers at real hostnames over https, with no port numbers. A small wrapper around Caddy.",
   "type": "module",
   "bin": {
