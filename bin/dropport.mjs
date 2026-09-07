@@ -9,6 +9,7 @@
 // generated Caddyfile, the matching /etc/hosts lines, and a privileged service that
 // can bind 80 and 443. Caddy issues the certificates from its own local CA, which is
 // what makes https work without a browser warning.
+import { readFileSync } from "node:fs";
 import {
   CADDYFILE,
   HOME_DIR,
@@ -53,6 +54,10 @@ import {
 } from "../src/system.mjs";
 
 const [, , cmd = "status", ...rest] = process.argv;
+
+// Read from package.json rather than kept in a constant here: two places to change is
+// one place to forget, and a version command that lies is worse than none.
+const VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 const say = (m = "") => console.log(m);
 const die = (m) => {
   console.error(`  ${m}`);
@@ -268,6 +273,7 @@ dropport — local dev servers at real hostnames, over https, with no port
   dropport mdns                publish .local names so they resolve instantly
   dropport status              is it working
   dropport doctor              why is it not working
+  dropport version             which dropport this is
 
 Example
   dropport add remoteledger 5173
@@ -325,6 +331,12 @@ try {
     case "help":
     case "--help":
     case "-h": say(HELP); break;
+    // every spelling anyone reaches for, because being told "unknown command" for
+    // --version is a small insult repeated daily
+    case "version":
+    case "--version":
+    case "-v":
+    case "-V": say(VERSION); break;
     default:
       say(`  unknown command "${cmd}"`);
       say(HELP);

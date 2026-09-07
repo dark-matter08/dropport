@@ -71,3 +71,21 @@ test("browser certificate stores are found wherever the browser keeps them", () 
 
   rmSync(home, { recursive: true, force: true });
 });
+
+test("every spelling of version answers, and answers the truth", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const cli = new URL("../bin/dropport.mjs", import.meta.url).pathname;
+  const { version } = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+
+  // "unknown command --version" for the most reflexive thing anyone types is a small
+  // insult repeated daily. All four spellings, because people reach for all four.
+  for (const flag of ["version", "--version", "-v", "-V"]) {
+    const out = execFileSync(process.execPath, [cli, flag], { encoding: "utf8" }).trim();
+    assert.equal(out, version, `dropport ${flag}`);
+  }
+
+  // read from package.json, never a second copy: a version command that lies is worse
+  // than not having one
+  const src = await readFile(new URL("../bin/dropport.mjs", import.meta.url), "utf8");
+  assert.match(src, /package\.json/, "the version must come from package.json");
+});
