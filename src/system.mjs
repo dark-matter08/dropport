@@ -36,6 +36,10 @@ export const DATA_DIR = MAC
 // service, so its data belongs under your profile — and needs no elevation to write.
 export const WIN_TASK = "dropport proxy";
 export const WIN_LAUNCHER = resolve(HOME_DIR, "run-caddy.cmd");
+export const WIN_STARTUP_VBS = resolve(
+  process.env.APPDATA || homedir(),
+  "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "dropport.vbs"
+);
 
 export function caddyPath() {
   const candidates = WIN
@@ -214,15 +218,29 @@ export function installService() {
       ].join("\r\n")
     );
     spawnSync("schtasks", ["/Delete", "/TN", WIN_TASK, "/F"], { stdio: "ignore" }); // may not exist
-    const created = spawnSync(
-      "schtasks",
-      ["/Create", "/TN", WIN_TASK, "/TR", `"${WIN_LAUNCHER}"`, "/SC", "ONLOGON", "/RL", "LIMITED", "/F"],
-      { stdio: "pipe", encoding: "utf8" }
-    );
-    if (created.status !== 0) {
-      throw new Error(`Windows refused the scheduled task: ${String(created.stderr || created.stdout || "").trim().slice(0, 200)}`);
+    // /SC ONLOGON with no /RU registers a task that fires for *any* user, and that
+    // needs elevation — it comes back "ERROR: Access is denied." Naming the current
+    // user scopes it to this account, which does not.
+    const who = process.env.USERNAME
+      ? `${process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\` : ""}${process.env.USERNAME}`
+      : null;
+    const args = ["/Create", "/TN", WIN_TASK, "/TR", `"${WIN_LAUNCHER}"`, "/SC", "ONLOGON", "/RL", "LIMITED", "/F"];
+    if (who) args.push("/RU", who);
+    const created = spawnSync("schtasks", args, { stdio: "pipe", encoding: "utf8" });
+
+    if (created.status === 0) {
+      spawnSync("schtasks", ["/Run", "/TN", WIN_TASK], { stdio: "ignore" });
+      return;
     }
-    spawnSync("schtasks", ["/Run", "/TN", WIN_TASK], { stdio: "ignore" });
+
+    // A locked-down machine can refuse task creation outright. The Startup folder is
+    // a file in your own profile and always works; a one-line VBScript runs the
+    // launcher hidden, so there is no console window at logon.
+    console.log(`  the scheduled task was refused (${String(created.stderr || created.stdout || "").trim().split(/\r?\n/)[0]})`);
+    console.log("  falling back to the Startup folder, which needs no permissions");
+    mkdirSync(dirname(WIN_STARTUP_VBS), { recursive: true });
+    writeFileSync(WIN_STARTUP_VBS, `CreateObject("WScript.Shell").Run """${WIN_LAUNCHER}""", 0, False\r\n`);
+    spawnSync("wscript.exe", [WIN_STARTUP_VBS], { stdio: "ignore" });
     return;
   }
 
@@ -243,6 +261,7 @@ export function uninstallService() {
   if (WIN) {
     spawnSync("schtasks", ["/End", "/TN", WIN_TASK], { stdio: "ignore" });
     spawnSync("schtasks", ["/Delete", "/TN", WIN_TASK, "/F"], { stdio: "ignore" });
+    rmSync(WIN_STARTUP_VBS, { force: true });
     rmSync(WIN_LAUNCHER, { force: true });
     return;
   }
@@ -297,7 +316,10 @@ export function uninstallMdns() {
 }
 
 export function serviceInstalled() {
-  if (WIN) return spawnSync("schtasks", ["/Query", "/TN", WIN_TASK], { stdio: "ignore" }).status === 0;
+  if (WIN) {
+    if (spawnSync("schtasks", ["/Query", "/TN", WIN_TASK], { stdio: "ignore" }).status === 0) return true;
+    return existsSync(WIN_STARTUP_VBS);
+  }
   return existsSync(MAC ? PLIST : SYSTEMD_UNIT);
 }
 
