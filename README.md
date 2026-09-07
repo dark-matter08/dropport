@@ -132,8 +132,13 @@ every start.
 
 ## Requirements
 
-Node 20+, and Caddy on your PATH. macOS and Linux. Windows can generate the config, but
-service installation and hosts edits are manual.
+Node 20+, and Caddy on your PATH. macOS, Linux and Windows.
+
+Windows works a little differently, and mostly in your favour. It has no concept of
+privileged ports, so the proxy runs as a logon task in your own session rather than as
+a system service — and the certificate authority goes into your user store, which
+needs no administrator either. The only thing that still raises a UAC prompt is the
+hosts file. One prompt instead of three.
 
 ## Licence
 
