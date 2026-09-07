@@ -27,6 +27,8 @@ import {
   HOSTS_FILE,
   caddyPath,
   certTrusted,
+  browserTrusted,
+  trustBrowsers,
   hostsNeedsUpdate,
   mdnsInstalled,
   installMdns,
@@ -299,8 +301,21 @@ try {
     }
     case "trust": {
       const apps = readRegistry();
-      const already = apps.length ? await certTrusted(urlFor(apps[0])) : false;
-      if (already) { say("  already trusted — nothing to do."); break; }
+      // Both stores, not just the system one. curl reads the system store, which
+      // `caddy trust` does fill — so on Linux this said "nothing to do" while Chrome
+      // went on calling the site insecure, and re-running it never got any further.
+      const inSystem = apps.length ? await certTrusted(urlFor(apps[0])) : false;
+      if (inSystem && browserTrusted()) { say("  already trusted — nothing to do."); break; }
+      if (inSystem) {
+        // only the browsers are missing it; no need to escalate for the system store
+        const r = trustBrowsers();
+        if (r.added) {
+          say(`  told ${r.added} browser profile${r.added === 1 ? "" : "s"} about it`);
+          say("  restart your browser for it to take effect.");
+          break;
+        }
+        if (r.note) say(`  note: ${r.note}`);
+      }
       trustCa();
       say("  local CA trusted — https should be clean now.");
       break;

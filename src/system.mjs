@@ -5,8 +5,8 @@
 // that escalates, and it always says what it is about to do first.
 import { execFileSync, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, platform } from "node:os";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, platform, tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { HOME_DIR, CADDYFILE, REGISTRY, applyHostsLines, buildCaddyfile, normalise, portDecision } from "./config.mjs";
 
@@ -331,6 +331,136 @@ export function reload() {
   return r.status === 0;
 }
 
+// --- browser trust stores ----------------------------------------------------
+//
+// Browsers do not all read the system trust store. Chrome and Chromium on Linux keep
+// their own NSS database under ~/.pki/nssdb, and Firefox keeps one per profile on
+// every platform. `caddy trust` writes to them too — but only when it can find them,
+// and dropport runs it under sudo with HOME pointed at the daemon's data directory,
+// so what it actually finds is root's. The system store gets the certificate, curl
+// is satisfied, and the browser goes on calling the site insecure.
+//
+// So we install it into the invoking user's stores ourselves, by name.
+
+const NSS_NICK = "dropport local authority";
+
+function onPath(bin) {
+  return spawnSync(WIN ? "where" : "which", [bin], { stdio: "ignore" }).status === 0;
+}
+
+export function rootCertPath() {
+  return resolve(DATA_DIR, "caddy", "pki", "authorities", "local", "root.crt");
+}
+
+/** A copy this user can read: the daemon's own is written as root. */
+function readableRoot() {
+  const src = rootCertPath();
+  if (!existsSync(src)) return null;
+  try {
+    readFileSync(src);
+    return src;
+  } catch {
+    const tmp = resolve(tmpdir(), "dropport-root.crt");
+    // one escalation, not two: install copies and sets the mode in a single call
+    sudo(["install", "-m", "644", src, tmp], { why: "reading the local certificate authority" });
+    return existsSync(tmp) ? tmp : null;
+  }
+}
+
+/** Every NSS database belonging to this user: Chromium's, and each Firefox profile. */
+export function nssProfiles(home = homedir(), os = platform()) {
+  const mac = os === "darwin";
+  const win = os === "win32";
+  const found = [];
+  const chromium = resolve(home, ".pki", "nssdb");
+  if (!win && !mac) found.push({ dir: chromium, kind: "chromium" });
+
+  const firefoxRoots = mac
+    ? [resolve(home, "Library", "Application Support", "Firefox", "Profiles")]
+    : [
+        resolve(home, ".mozilla", "firefox"),
+        // snap and flatpak each keep their own home
+        resolve(home, "snap", "firefox", "common", ".mozilla", "firefox"),
+        resolve(home, ".var", "app", "org.mozilla.firefox", ".mozilla", "firefox"),
+      ];
+  for (const base of firefoxRoots) {
+    if (!existsSync(base)) continue;
+    for (const entry of readdirSync(base)) {
+      const dir = resolve(base, entry);
+      if (existsSync(resolve(dir, "cert9.db"))) found.push({ dir, kind: "firefox" });
+    }
+  }
+  return found;
+}
+
+function ensureCertutil() {
+  if (onPath("certutil")) return true;
+  if (MAC) return false; // comes with `brew install nss`; not worth installing behind your back
+  const managers = [
+    ["apt-get", ["install", "-y", "libnss3-tools"]],
+    ["dnf", ["install", "-y", "nss-tools"]],
+    ["pacman", ["-S", "--noconfirm", "nss"]],
+    ["zypper", ["install", "-y", "mozilla-nss-tools"]],
+  ];
+  const mgr = managers.find(([bin]) => onPath(bin));
+  if (!mgr) return false;
+  try {
+    sudo([mgr[0], ...mgr[1]], { why: "installing certutil, which is how a browser is told about a certificate" });
+  } catch {
+    return false;
+  }
+  return onPath("certutil");
+}
+
+/**
+ * Put the CA root into this user's browser stores. Returns what happened rather than
+ * throwing: the system store is already done by this point, and a browser that cannot
+ * be reached is worth reporting, not worth failing the whole command over.
+ */
+export function trustBrowsers() {
+  const root = readableRoot();
+  if (!root) return { added: 0, skipped: [], note: "the local certificate authority is not on disk yet" };
+
+  const profiles = nssProfiles();
+  if (!profiles.length) return { added: 0, skipped: [], note: "no browser certificate store found for your user" };
+  if (!ensureCertutil()) {
+    return {
+      added: 0,
+      skipped: profiles.map((p) => p.dir),
+      note: MAC
+        ? "certutil is missing — `brew install nss`, then run this again"
+        : "certutil is missing and could not be installed — install libnss3-tools, then run this again",
+    };
+  }
+
+  const added = [];
+  const skipped = [];
+  for (const { dir, kind } of profiles) {
+    if (kind === "chromium" && !existsSync(resolve(dir, "cert9.db"))) {
+      // Chrome creates this on first run; make it ourselves so trusting works before
+      // the browser has ever been opened
+      mkdirSync(dir, { recursive: true });
+      spawnSync("certutil", ["-N", "--empty-password", "-d", `sql:${dir}`], { stdio: "ignore" });
+    }
+    const db = `sql:${dir}`;
+    // drop any earlier copy first, or a re-issued CA leaves a stale one alongside
+    spawnSync("certutil", ["-D", "-n", NSS_NICK, "-d", db], { stdio: "ignore" });
+    const r = spawnSync("certutil", ["-A", "-t", "C,,", "-n", NSS_NICK, "-i", root, "-d", db], { stdio: "pipe" });
+    (r.status === 0 ? added : skipped).push(dir);
+  }
+  return { added: added.length, skipped, profiles: added };
+}
+
+/** Is the CA in this user's browser stores? Answers what the browser will do. */
+export function browserTrusted() {
+  if (WIN) return true; // Chrome and Edge read the Windows store certutil -addstore writes to
+  const profiles = nssProfiles();
+  if (!profiles.length || !onPath("certutil")) return true; // nothing to check against
+  return profiles.some(
+    ({ dir }) => spawnSync("certutil", ["-L", "-n", NSS_NICK, "-d", `sql:${dir}`], { stdio: "ignore" }).status === 0
+  );
+}
+
 /**
  * Install Caddy's local CA into the system trust store. Must use the daemon's data
  * directory, or it would trust a different CA than the one actually serving.
@@ -361,6 +491,16 @@ export function trustCa() {
     ["env", `HOME=${DATA_DIR}`, `XDG_DATA_HOME=${DATA_DIR}`, caddy, "trust", "--address", ADMIN_ADDR],
     { why: "adding the local certificate authority to your system trust store" }
   );
+
+  // and now the stores the browsers actually read. The call above runs as root with
+  // HOME redirected, so whatever it did for NSS it did for the wrong user.
+  const browsers = trustBrowsers();
+  if (browsers.added) {
+    console.log(`  told ${browsers.added} browser profile${browsers.added === 1 ? "" : "s"} about it`);
+    console.log("  restart your browser for it to take effect");
+  } else if (browsers.note) {
+    console.log(`  note: ${browsers.note}`);
+  }
 }
 
 /**

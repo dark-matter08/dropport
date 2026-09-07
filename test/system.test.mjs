@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { nssProfiles } from "../src/system.mjs";
 
 test("caddy is looked for where each Windows installer puts it", async () => {
   // winget, scoop and chocolatey all put it somewhere different, and none of them is
@@ -24,4 +28,46 @@ test("windows never falls into the systemd branch", async () => {
   const mac = install.indexOf("if (MAC)");
   assert.ok(win >= 0, "installService needs a Windows arm");
   assert.ok(win < mac, "the Windows arm must come first, and return before the unix paths");
+});
+
+test("browser certificate stores are found wherever the browser keeps them", () => {
+  // Chrome and Chromium on Linux keep their own NSS database, and Firefox keeps one
+  // per profile on every platform. `caddy trust` is run under sudo with HOME pointed
+  // at the daemon's data directory, so it looks for these in root's home and finds
+  // nothing — the system store gets the CA, curl is satisfied, and the browser still
+  // calls the site insecure. Finding them for the right user is the whole fix.
+  const home = mkdtempSync(join(tmpdir(), "dropport-home-"));
+
+  const ff = join(home, ".mozilla", "firefox", "abc123.default-release");
+  mkdirSync(ff, { recursive: true });
+  writeFileSync(join(ff, "cert9.db"), "");
+
+  const snap = join(home, "snap", "firefox", "common", ".mozilla", "firefox", "xyz.default");
+  mkdirSync(snap, { recursive: true });
+  writeFileSync(join(snap, "cert9.db"), "");
+
+  // a profile directory with no cert9.db is not a profile
+  mkdirSync(join(home, ".mozilla", "firefox", "Crash Reports"), { recursive: true });
+
+  const found = nssProfiles(home, "linux");
+  const dirs = found.map((f) => f.dir);
+
+  assert.ok(dirs.includes(ff), "the default Firefox profile");
+  assert.ok(dirs.includes(snap), "and the one snap keeps in its own home");
+  assert.ok(!dirs.some((d) => d.endsWith("Crash Reports")), "a directory without cert9.db is not a profile");
+
+  assert.ok(
+    dirs.includes(join(home, ".pki", "nssdb")),
+    "Chromium's store is included even before it exists — trust can run before the browser has ever opened"
+  );
+
+  // macOS keeps Firefox somewhere else entirely, and has no Chromium NSS store at all
+  const mac = nssProfiles(home, "darwin");
+  assert.equal(mac.length, 0, "the Linux layout is not looked for on macOS");
+  assert.ok(
+    !mac.some((f) => f.kind === "chromium"),
+    "Chrome on macOS reads the keychain, so there is no NSS store to write"
+  );
+
+  rmSync(home, { recursive: true, force: true });
 });
