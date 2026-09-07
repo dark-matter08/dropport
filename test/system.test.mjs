@@ -89,3 +89,24 @@ test("every spelling of version answers, and answers the truth", async () => {
   const src = await readFile(new URL("../bin/dropport.mjs", import.meta.url), "utf8");
   assert.match(src, /package\.json/, "the version must come from package.json");
 });
+
+test("a missing certutil is not a trusted browser", async () => {
+  const { browserTrusted } = await import("../src/system.mjs");
+  const profiles = [{ dir: "/home/someone/.pki/nssdb", kind: "chromium" }];
+
+  // This returned true — "nothing to check against" — which made `trust` announce
+  // "already trusted, nothing to do" and skip the step that installs certutil, on
+  // exactly the machines that had none. A check that cannot see the problem must not
+  // report success; that is the same mistake the browser-trust fix was about.
+  assert.equal(
+    browserTrusted({ profiles, hasCertutil: false, win: false }),
+    false,
+    "without certutil nothing can have been installed, so the answer is no"
+  );
+
+  // nothing to tell is genuinely fine
+  assert.equal(browserTrusted({ profiles: [], hasCertutil: false, win: false }), true);
+
+  // Windows reads the system store, so there is no NSS question to ask
+  assert.equal(browserTrusted({ profiles, hasCertutil: false, win: true }), true);
+});

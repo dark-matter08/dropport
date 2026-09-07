@@ -352,18 +352,54 @@ export function rootCertPath() {
   return resolve(DATA_DIR, "caddy", "pki", "authorities", "local", "root.crt");
 }
 
-/** A copy this user can read: the daemon's own is written as root. */
-function readableRoot() {
+/** The CA root in PEM, from the running proxy — the same place `caddy trust` reads it. */
+async function fetchRootPem() {
+  const [host, port] = ADMIN_ADDR.split(":");
+  const http = (await import("node:http")).default;
+  return new Promise((resolve) => {
+    const req = http.get({ host, port: Number(port), path: "/pki/ca/local", timeout: 4000 }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => (body += c));
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(body).root_certificate || null);
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.on("error", () => resolve(null));
+  });
+}
+
+/**
+ * A copy of the CA root this user can read.
+ *
+ * Asked of the proxy rather than looked for on disk. Caddy keeps the authority under
+ * its data directory with the private key beside it, so the directory is root-owned
+ * and not traversable by the user running this — existsSync could not even stat the
+ * file and answered "false", which came out as "the local certificate authority is
+ * not on disk yet" on a machine where it was plainly on disk and already serving.
+ *
+ * The admin API hands it over with no privilege at all, and it is by definition the
+ * authority actually in use rather than whatever a path happens to hold.
+ */
+async function readableRoot() {
+  const pem = await fetchRootPem();
+  if (pem) {
+    const tmp = resolve(tmpdir(), "dropport-root.crt");
+    writeFileSync(tmp, pem);
+    return tmp;
+  }
+  // no proxy answering: fall back to the copy on disk, if this user can read it
   const src = rootCertPath();
-  if (!existsSync(src)) return null;
   try {
     readFileSync(src);
     return src;
   } catch {
-    const tmp = resolve(tmpdir(), "dropport-root.crt");
-    // one escalation, not two: install copies and sets the mode in a single call
-    sudo(["install", "-m", "644", src, tmp], { why: "reading the local certificate authority" });
-    return existsSync(tmp) ? tmp : null;
+    return null;
   }
 }
 
@@ -396,16 +432,18 @@ export function nssProfiles(home = homedir(), os = platform()) {
 function ensureCertutil() {
   if (onPath("certutil")) return true;
   if (MAC) return false; // comes with `brew install nss`; not worth installing behind your back
+  // Retry behind an update: on a rolling distribution stale package lists are normal,
+  // and "Unable to locate package" is what they look like. One escalation, not two.
   const managers = [
-    ["apt-get", ["install", "-y", "libnss3-tools"]],
-    ["dnf", ["install", "-y", "nss-tools"]],
-    ["pacman", ["-S", "--noconfirm", "nss"]],
-    ["zypper", ["install", "-y", "mozilla-nss-tools"]],
+    ["apt-get", "apt-get install -y libnss3-tools || (apt-get update && apt-get install -y libnss3-tools)"],
+    ["dnf", "dnf install -y nss-tools"],
+    ["pacman", "pacman -S --noconfirm nss"],
+    ["zypper", "zypper install -y mozilla-nss-tools"],
   ];
   const mgr = managers.find(([bin]) => onPath(bin));
   if (!mgr) return false;
   try {
-    sudo([mgr[0], ...mgr[1]], { why: "installing certutil, which is how a browser is told about a certificate" });
+    sudo(["sh", "-c", mgr[1]], { why: "installing certutil, which is how a browser is told about a certificate" });
   } catch {
     return false;
   }
@@ -417,9 +455,9 @@ function ensureCertutil() {
  * throwing: the system store is already done by this point, and a browser that cannot
  * be reached is worth reporting, not worth failing the whole command over.
  */
-export function trustBrowsers() {
-  const root = readableRoot();
-  if (!root) return { added: 0, skipped: [], note: "the local certificate authority is not on disk yet" };
+export async function trustBrowsers() {
+  const root = await readableRoot();
+  if (!root) return { added: 0, skipped: [], note: "could not obtain the certificate authority — is the proxy running?" };
 
   const profiles = nssProfiles();
   if (!profiles.length) return { added: 0, skipped: [], note: "no browser certificate store found for your user" };
@@ -452,10 +490,14 @@ export function trustBrowsers() {
 }
 
 /** Is the CA in this user's browser stores? Answers what the browser will do. */
-export function browserTrusted() {
-  if (WIN) return true; // Chrome and Edge read the Windows store certutil -addstore writes to
-  const profiles = nssProfiles();
-  if (!profiles.length || !onPath("certutil")) return true; // nothing to check against
+export function browserTrusted({ profiles = nssProfiles(), hasCertutil = onPath("certutil"), win = WIN } = {}) {
+  if (win) return true; // Chrome and Edge read the Windows store certutil -addstore writes to
+  if (!profiles.length) return true; // genuinely nothing to tell
+  // Not "true" when certutil is missing. Without it nothing can have been installed
+  // into a browser store, so the honest answer is no — and answering yes made `trust`
+  // report success and skip the very step that installs certutil, on exactly the
+  // machines that had none. The same shape of mistake this whole fix was about.
+  if (!hasCertutil) return false;
   return profiles.some(
     ({ dir }) => spawnSync("certutil", ["-L", "-n", NSS_NICK, "-d", `sql:${dir}`], { stdio: "ignore" }).status === 0
   );
@@ -465,7 +507,7 @@ export function browserTrusted() {
  * Install Caddy's local CA into the system trust store. Must use the daemon's data
  * directory, or it would trust a different CA than the one actually serving.
  */
-export function trustCa() {
+export async function trustCa() {
   const caddy = caddyPath();
   if (!caddy) throw new Error("caddy not found");
   if (!serviceInstalled()) throw new Error("the proxy is not installed yet — run dropport up first");
@@ -494,7 +536,7 @@ export function trustCa() {
 
   // and now the stores the browsers actually read. The call above runs as root with
   // HOME redirected, so whatever it did for NSS it did for the wrong user.
-  const browsers = trustBrowsers();
+  const browsers = await trustBrowsers();
   if (browsers.added) {
     console.log(`  told ${browsers.added} browser profile${browsers.added === 1 ? "" : "s"} about it`);
     console.log("  restart your browser for it to take effect");

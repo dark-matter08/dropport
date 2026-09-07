@@ -314,7 +314,7 @@ try {
       if (inSystem && browserTrusted()) { say("  already trusted — nothing to do."); break; }
       if (inSystem) {
         // only the browsers are missing it; no need to escalate for the system store
-        const r = trustBrowsers();
+        const r = await trustBrowsers();
         if (r.added) {
           say(`  told ${r.added} browser profile${r.added === 1 ? "" : "s"} about it`);
           say("  restart your browser for it to take effect.");
@@ -322,7 +322,7 @@ try {
         }
         if (r.note) say(`  note: ${r.note}`);
       }
-      trustCa();
+      await trustCa();
       say("  local CA trusted — https should be clean now.");
       break;
     }
