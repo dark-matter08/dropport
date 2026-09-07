@@ -11,6 +11,7 @@ import { dirname, resolve } from "node:path";
 import { HOME_DIR, CADDYFILE, REGISTRY, applyHostsLines, buildCaddyfile, normalise, portDecision } from "./config.mjs";
 
 export const MAC = platform() === "darwin";
+export const WIN = platform() === "win32";
 // Overridable so the whole flow can be exercised against a scratch file in tests
 // rather than requiring root and mutating the real one.
 export const HOSTS_FILE =
@@ -26,14 +27,33 @@ export const MDNS_PLIST = resolve(homedir(), "Library", "LaunchAgents", `${MDNS_
 // Root-owned so the daemon can write certificates; the local CA lives here too, which
 // is why `trust` has to point at the same directory.
 export const ADMIN_ADDR = "127.0.0.1:2019";
-export const DATA_DIR = MAC ? "/Library/Application Support/dropport" : "/var/lib/dropport";
+export const DATA_DIR = MAC
+  ? "/Library/Application Support/dropport"
+  : WIN
+    ? resolve(process.env.LOCALAPPDATA || homedir(), "dropport")
+    : "/var/lib/dropport";
+// Windows runs the proxy as a logon task in your own session rather than as a system
+// service, so its data belongs under your profile — and needs no elevation to write.
+export const WIN_TASK = "dropport proxy";
+export const WIN_LAUNCHER = resolve(HOME_DIR, "run-caddy.cmd");
 
 export function caddyPath() {
-  for (const p of ["/opt/homebrew/bin/caddy", "/usr/local/bin/caddy", "/usr/bin/caddy"]) {
-    if (existsSync(p)) return p;
+  const candidates = WIN
+    ? [
+        // winget drops a shim here; scoop and chocolatey have their own
+        resolve(process.env.LOCALAPPDATA || "", "Microsoft", "WinGet", "Links", "caddy.exe"),
+        resolve(homedir(), "scoop", "shims", "caddy.exe"),
+        "C:\\ProgramData\\chocolatey\\bin\\caddy.exe",
+        resolve(process.env.ProgramFiles || "C:\\Program Files", "Caddy", "caddy.exe"),
+      ]
+    : ["/opt/homebrew/bin/caddy", "/usr/local/bin/caddy", "/usr/bin/caddy"];
+  for (const p of candidates) {
+    if (p && existsSync(p)) return p;
   }
   try {
-    return execFileSync("which", ["caddy"], { stdio: "pipe" }).toString().trim() || null;
+    const out = execFileSync(WIN ? "where" : "which", ["caddy"], { stdio: "pipe" }).toString();
+    // `where` can return several lines; the first is the one that would run
+    return out.split(/\r?\n/).map((l) => l.trim()).find(Boolean) || null;
   } catch {
     return null;
   }
@@ -95,6 +115,27 @@ export function syncHosts(apps) {
   const tmp = resolve(HOME_DIR, "hosts.staged");
   mkdirSync(HOME_DIR, { recursive: true });
   writeFileSync(tmp, next);
+
+  if (WIN) {
+    // The one thing on Windows that still needs an administrator. Start-Process -Verb
+    // RunAs raises the UAC prompt; -Wait so we do not carry on before it has happened,
+    // and Copy-Item so a failure cannot leave a half-written hosts file.
+    console.log(`  Windows will ask for administrator access, to update ${HOSTS_FILE}`);
+    const r = spawnSync(
+      "powershell",
+      [
+        "-NoProfile", "-Command",
+        `Start-Process -FilePath powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList ` +
+          `'-NoProfile','-Command','Copy-Item -LiteralPath ''${tmp}'' -Destination ''${HOSTS_FILE}'' -Force'`,
+      ],
+      { stdio: "inherit" }
+    );
+    if (r.status !== 0) throw new Error(`could not update ${HOSTS_FILE} — administrator access was refused`);
+    // Windows caches name lookups too, and a stale negative entry outlives the edit
+    spawnSync("ipconfig", ["/flushdns"], { stdio: "ignore" });
+    return true;
+  }
+
   // copy rather than edit in place, so a failure never leaves a half-written hosts file
   sudo(["cp", tmp, HOSTS_FILE], { why: `updating ${HOSTS_FILE} with your dropport hostnames` });
   if (MAC) {
@@ -152,9 +193,38 @@ WantedBy=multi-user.target
 export function installService() {
   const caddy = caddyPath();
   if (!caddy) throw new Error("caddy not found — install it first (brew install caddy)");
-  const staged = resolve(HOME_DIR, MAC ? "service.plist" : "dropport.service");
   mkdirSync(HOME_DIR, { recursive: true });
-  writeFileSync(staged, MAC ? plist(caddy) : unit(caddy));
+  const staged = resolve(HOME_DIR, MAC ? "service.plist" : "dropport.service");
+  if (!WIN) writeFileSync(staged, MAC ? plist(caddy) : unit(caddy));
+
+  if (WIN) {
+    // Windows has no privileged-port concept: any process can bind 80 and 443 if they
+    // are free. So this is a logon task in the user's own session rather than a system
+    // service, and the only thing left that needs an administrator is the hosts file.
+    mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(
+      WIN_LAUNCHER,
+      [
+        "@echo off",
+        `set "HOME=${DATA_DIR}"`,
+        `set "XDG_DATA_HOME=${DATA_DIR}"`,
+        `set "XDG_CONFIG_HOME=${DATA_DIR}"`,
+        `"${caddy}" run --config "${CADDYFILE}" --adapter caddyfile >> "${resolve(DATA_DIR, "dropport.log")}" 2>&1`,
+        "",
+      ].join("\r\n")
+    );
+    spawnSync("schtasks", ["/Delete", "/TN", WIN_TASK, "/F"], { stdio: "ignore" }); // may not exist
+    const created = spawnSync(
+      "schtasks",
+      ["/Create", "/TN", WIN_TASK, "/TR", `"${WIN_LAUNCHER}"`, "/SC", "ONLOGON", "/RL", "LIMITED", "/F"],
+      { stdio: "pipe", encoding: "utf8" }
+    );
+    if (created.status !== 0) {
+      throw new Error(`Windows refused the scheduled task: ${String(created.stderr || created.stdout || "").trim().slice(0, 200)}`);
+    }
+    spawnSync("schtasks", ["/Run", "/TN", WIN_TASK], { stdio: "ignore" });
+    return;
+  }
 
   sudo(["mkdir", "-p", DATA_DIR], { why: `creating ${DATA_DIR} for certificates and logs` });
   if (MAC) {
@@ -170,6 +240,12 @@ export function installService() {
 }
 
 export function uninstallService() {
+  if (WIN) {
+    spawnSync("schtasks", ["/End", "/TN", WIN_TASK], { stdio: "ignore" });
+    spawnSync("schtasks", ["/Delete", "/TN", WIN_TASK, "/F"], { stdio: "ignore" });
+    rmSync(WIN_LAUNCHER, { force: true });
+    return;
+  }
   if (MAC) {
     spawnSync("sudo", ["launchctl", "bootout", "system", PLIST], { stdio: "ignore" });
     sudo(["rm", "-f", PLIST], { why: "removing the launch daemon" });
@@ -221,6 +297,7 @@ export function uninstallMdns() {
 }
 
 export function serviceInstalled() {
+  if (WIN) return spawnSync("schtasks", ["/Query", "/TN", WIN_TASK], { stdio: "ignore" }).status === 0;
   return existsSync(MAC ? PLIST : SYSTEMD_UNIT);
 }
 
@@ -240,6 +317,20 @@ export function trustCa() {
   const caddy = caddyPath();
   if (!caddy) throw new Error("caddy not found");
   if (!serviceInstalled()) throw new Error("the proxy is not installed yet — run dropport up first");
+
+  if (WIN) {
+    // -user, not the machine store: adding to your own store needs no administrator,
+    // and Chrome and Edge read it. Firefox keeps its own store and will still warn —
+    // the same as on macOS.
+    const root = resolve(DATA_DIR, "caddy", "pki", "authorities", "local", "root.crt");
+    if (!existsSync(root)) {
+      throw new Error(`the local certificate authority is not there yet (${root}) — start the proxy once, then trust it`);
+    }
+    const r = spawnSync("certutil", ["-addstore", "-user", "Root", root], { stdio: "inherit" });
+    if (r.status !== 0) throw new Error("certutil could not add the certificate authority");
+    return;
+  }
+
   // caddy trust asks the running proxy for its CA over the admin API. The default
   // "localhost" resolves to ::1 first, while the admin endpoint binds IPv4 only, so
   // it fails with a bare "connection refused". Naming the address avoids the whole
